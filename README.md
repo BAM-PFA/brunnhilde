@@ -8,14 +8,15 @@ Generates aggregate reports of files in a directory or disk image based on input
 
 For the graphical user interface (GUI) version of Brunnhilde, see [Brunnhilde GUI](https://github.com/tw4l/brunnhilde-gui).   
 
-Brunnhilde runs Siegfried against a specified directory or disk image, loads the results into a sqlite3 database, and queries the database to generate reports to aid in triage, arrangement, and description of digital archives. The program will also check for viruses unless specified otherwise, and will optionally run bulk_extractor against the given source. Outputs include:  
+Brunnhilde runs Siegfried against a specified directory or disk image, loads the results into a sqlite3 database, and queries the database to generate reports to aid in triage, arrangement, and description of digital archives. The program will also check for viruses unless specified otherwise, and will optionally run bulk_extractor against the given source. Users may optionally run mediainfo to obtain reports on audiovisual material within an accession. Outputs include:  
 
-* `report.html`: Includes some provenance information on the scan itself, aggregate statistics for the material as a whole (number of files, begin and end dates, number of unique vs. duplicate files, etc.), and detailed reports on content found (file formats, file format versions, MIME types, last modified dates by year, unidentified files, Siegfried warnings/errors, duplicate files, and -optionally - Social Security Numbers found by bulk_extractor).
-* `csv_reports` folder: Contains CSV results queried from database on file formats, file format versions, MIME types, last modified dates by year, unidentified files, Siegfried warnings and errors, and duplicate files.  
-* `siegfried.csv`: Full CSV output from Siegfried  
+* `report.html`: Includes some provenance information on the scan itself, aggregate statistics for the material as a whole (number of files, begin and end dates, number of unique vs. duplicate files, etc.), and detailed reports on content found (file formats, file format versions, MIME types, last modified dates by year, unidentified files, Siegfried warnings/errors, duplicate files, -optionally - Social Security Numbers found by bulk_extractor, and optionally statistics specific to audiovisual materials). 
+* `csv_reports` folder: Contains CSV results queried from database on file formats, file format versions, MIME types, last modified dates by year, unidentified files, Siegfried warnings and errors, duplicate files, and optional reports specific to video and audio files.  
+* `siegfried.csv`: Full CSV output from Siegfried
 
 Optionally, outputs may also include:  
 
+* `mediainfo.json`: JSON output from running mediainfo on the input directory.
 * `tree.txt`: Tree report of the directory structure of directory or file system on disk image (in Linux and macOS only)  
 * `bulk_extractor` folder: Contains bulk_extractor outputs (if selected).  
 * `carved_files` folder: Contains files carved from disk images by tsk_recover or HFS Explorer (generated in `-d` mode; can be deleted at end of process by passing the `-r` or `--removefiles` flag to Brunnhilde).  
@@ -57,7 +58,7 @@ usage: brunnhilde.py [-h] [-a] [-b] [--ssn_mode SSN_MODE] [--regex REGEX] [-d]
                      [--tsk_fstype TSK_FSTYPE]
                      [--tsk_sector_offset TSK_SECTOR_OFFSET] [--hash HASH] [-k]
                      [-l] [-n] [-r] [-t] [-v] [-V] [-w] [-z] [--csv CSV]
-                     [--stdin] [-o]
+                     [--stdin] [-o] [-m]
                      source destination [basename]
 
 positional arguments:
@@ -101,6 +102,7 @@ optional arguments:
   --hash HASH           Specify hash algorithm
   -k, --keepsqlite      Retain Brunnhilde-generated sqlite db after processing
   -l, --largefiles      Enable virus scanning of large files
+  -m, --mediainfo       Run Mediainfo on source directory
   -n, --noclam          Skip ClamAV virus scan
   -r, --removefiles     Delete 'carved_files' directory when done (disk image
                         input only)
