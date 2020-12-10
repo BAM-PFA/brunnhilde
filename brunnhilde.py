@@ -24,6 +24,7 @@ import csv
 import datetime
 import errno
 from itertools import islice
+import json
 import logging
 import math
 import os
@@ -33,6 +34,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 
 
 BRUNNHILDE_VERSION = "brunnhilde 1.9.1"
@@ -181,6 +183,17 @@ def run_siegfried(args, source_dir, use_hash):
     log_info("Siegfried scan complete. Processing results.")
 
 
+def run_mediainfo(args, source_dir):
+    if args.mediainfo: 
+        log_info("Running Mediainfo.", time_warning=True)
+        mediainfo_command = 'mediainfo -f --Output=JSON "{}" > "{}"'.format(
+            source_dir,
+            mi_file
+            )
+        subprocess.run(mediainfo_command, shell=True)
+        log_info("Mediainfo scan complete. Processing results.")
+
+
 def run_clamav(args, source_dir):
     """Run ClamAV on directory"""
     timestamp = str(datetime.datetime.now())
@@ -256,8 +269,56 @@ def convert_size(size):
     return "%s %s" % (s, size_name[i])
 
 
-def import_csv(cursor, conn, use_hash):
-    """Import csv file into sqlite db
+def h_m_s(seconds):
+    hms = time.strftime('%H hours %M minutes %S seconds', time.gmtime(int(seconds)))
+    return hms
+
+
+def sniff_item(item_row,mediainfo_fields):
+    """Parse Mediainfo JSON for a single item to
+    test if it's counted as AV. If it is, it will be added to db 
+    otherwise return False.
+    """
+    row = None
+    try:
+        is_av = True
+        item_format = None
+        general_track = [
+            track for track in item_row["media"]["track"]
+            if track["@type"] == "General"
+            ][0]
+        if "VideoCount" in general_track:
+            item_format = "Video"
+        elif "AudioCount" in general_track:
+            item_format = "Audio"
+        elif "ImageCount" in general_track:
+            item_format = "Image"
+        else:
+            is_av = False
+    except:
+        is_av = False
+        item_format = None
+    if is_av:
+        row = []
+        for av_type in ("Video","Audio","Image"):
+            if item_format == av_type:
+                # Pick the first matched track to represent the whole
+                representative_track = [
+                    track for track in item_row["media"]["track"]
+                    if track["@type"] == item_format
+                    ][0]
+        for field in mediainfo_fields:
+            try:
+                row.append(representative_track[field])
+            except KeyError:
+                row.append("")
+        row.append(item_format) # add the item format (Video/Audio/Image)
+        row.append(item_row["media"]["@ref"]) # add the filepath
+    return row
+
+
+def import_data(args, cursor, conn, use_hash):
+    """Import Siegfried CSV and Mediainfo JSON files into sqlite db
 
     Returns use_hash as a mechanism for updating the value if the input
     Siegfried CSV is found to have a hash column. This provides a
@@ -279,6 +340,16 @@ def import_csv(cursor, conn, use_hash):
         reader = csv.reader(
             x.replace("\0", "") for x in f
         )  # replace null bytes with empty strings on read
+
+    # Create Mediainfo JSON object
+    if args.mediainfo:
+        if sys.version_info > (3, 0):
+            m = open(mi_file, "r", encoding="utf8")
+        else:
+            m = open(mi_file, "rb")
+        mediainfo_json = json.load(m)
+        m.close()
+
 
     # Read CSV into database
     header = True
@@ -308,13 +379,49 @@ def import_csv(cursor, conn, use_hash):
             # skip lines that don't have right number of columns
             if len(row) == rowlen:
                 cursor.execute(insertsql, row)
+
+    # Read Mediainfo JSON into database
+    if args.mediainfo:
+        mediainfo_fields = [
+            "Format_String",
+            "Format_Profile",
+            "Duration",
+            "Width",
+            "Height",
+            "DisplayAspectRatio_String",
+            "FrameRate",
+            "CodecID",
+            "SamplingRate_String",
+            "BitDepth_String"
+            ]
+        add_table = """CREATE TABLE mediainfo ({} text, format text, filepath text)""".format(" text, ".join(mediainfo_fields))
+        cursor.execute(add_table)
+        n_items = len(mediainfo_json)
+        insertsql = "INSERT INTO mediainfo VALUES ({})".format(
+                ", ".join(["?" for column in row])
+            )
+        if n_items == 1:
+            row = sniff_item(mediainfo_json,mediainfo_fields)
+            if row:
+                insertsql = "INSERT INTO mediainfo VALUES ({})".format(
+                    ", ".join(["?" for column in row])
+                )
+                cursor.execute(insertsql, row)
+        else:
+            for item_row in mediainfo_json:
+                row = sniff_item(item_row,mediainfo_fields)
+                if row:
+                    insertsql = "INSERT INTO mediainfo VALUES ({})".format(
+                        ", ".join(["?" for column in row])
+                    )
+                    cursor.execute(insertsql, row)
     conn.commit()
     f.close()
     return use_hash
 
 
 def create_html_report(
-    args, source_dir, scan_started, cursor, html, siegfried_version, use_hash,
+    args, source_dir, scan_started, cursor, html, siegfried_version, mediainfo_version, use_hash,
 ):
     """Get aggregate statistics and write to html report"""
     # Gather stats from database.
@@ -426,6 +533,11 @@ def create_html_report(
     num_formats = cursor.fetchone()[0]
 
     cursor.execute(
+        "SELECT COUNT(DISTINCT Format_String) as av_formats from mediainfo WHERE Format_String <> '';"
+    )  # number of identfied file formats
+    num_av_formats = cursor.fetchone()[0]
+
+    cursor.execute(
         "SELECT COUNT(*) FROM siegfried WHERE errors <> '';"
     )  # number of siegfried errors
     num_errors = cursor.fetchone()[0]
@@ -478,6 +590,8 @@ def create_html_report(
         html.write('\n<a href="#Virus report">Virus report</a>')
     html.write('\n<a href="#File formats">File formats</a>')
     html.write('\n<a href="#File format versions">Versions</a>')
+    if args.mediainfo:
+        html.write('\n<a href="#Audiovisual file formats">AV formats</a>')
     html.write('\n<a href="#MIME types">MIME types</a>')
     html.write('\n<a href="#Last modified dates by year">Dates</a>')
     html.write('\n<a href="#Unidentified">Unidentified</a>')
@@ -510,6 +624,10 @@ def create_html_report(
         )
         html.write("\n<p><strong>Siegfried command:</strong> {}</p>".format(sf_command))
     html.write("\n<p><strong>Scan started:</strong> {}</p>".format(scan_started))
+    if args.mediainfo:
+        html.write(
+            "\n<p><strong>Mediainfo version:</strong> {}</p>".format(mediainfo_version)
+        )
     html.write("\n</div>")
 
     # statistics
@@ -547,6 +665,9 @@ def create_html_report(
         "\n<p><strong>Identified file formats:</strong> {}</p>".format(num_formats)
     )
     html.write(
+        "\n<p><strong>Identified Audiovisual formats:</strong> {}</p>".format(num_av_formats)
+    )
+    html.write(
         "\n<p><strong>Unidentified files:</strong> {}".format(unidentified_files)
     )
     if unidentified_files:
@@ -554,6 +675,25 @@ def create_html_report(
     else:
         html.write(" </p>")
     html.write("\n<hr>")
+    if args.mediainfo:
+        formats = [x for x, in cursor.execute("SELECT DISTINCT format from mediainfo").fetchall()]
+        for _format in formats:
+            durations = [
+                round(float(x)) for x, in 
+                    cursor.execute("SELECT Duration from mediainfo WHERE format == '{}';".format(_format)
+                        ).fetchall()
+                    if x
+                ]
+            if durations:
+                max_duration = h_m_s(max(durations))
+                min_duration = h_m_s(min(durations))
+                html.write(
+                    "\n<p><strong>Maximum {} duration:</strong> {}".format(_format.lower(), max_duration)
+                )
+                html.write(
+                    "\n<p><strong>Minimum {} duration:</strong> {}".format(_format.lower(), min_duration)
+                )
+                html.write("\n<hr>")
     if args.warnings:
         html.write("\n<p><strong>Siegfried warnings:</strong> {}".format(num_warnings))
         if num_warnings:
@@ -610,6 +750,45 @@ def generate_reports(args, cursor, html, use_hash):
     sqlite_to_csv(sql, path, version_header, cursor)
     write_html_report_section("File format versions", path, ",", html)
 
+    if args.mediainfo:
+        # sorted av format/codec list report
+        sql = "SELECT Format_String, Format_Profile, CodecID, COUNT(*) as 'num' FROM mediainfo GROUP BY Format_String, Format_Profile ORDER BY num DESC"
+        path = os.path.join(csv_dir, "avFormats.csv")
+        av_format_header = ["Format", "Format Profile", "Codec ID", "Count"]
+        sqlite_to_csv(sql, path, av_format_header, cursor)
+        write_html_report_section("Audiovisual file formats", path, ",", html)
+
+        # AV technical summary(-ies)
+        formats = [x for x, in cursor.execute("SELECT DISTINCT format from mediainfo").fetchall()]
+        for _format in formats:
+            # size_sql = "SELECT size from siegfried INNER JOIN mediainfo ON siegfried.file == mediainfo.filepath WHERE mediainfo.format == '{}'".format(_format)
+            if _format == "Video":
+                # Framerate
+                path = os.path.join(csv_dir, "framerates.csv")
+                framerates_header = ["Frame Rate", "Count"]
+                sql = "SELECT FrameRate, COUNT(*) as 'num' FROM mediainfo WHERE format == 'Video' GROUP BY FrameRate ORDER BY num DESC"
+                sqlite_to_csv(sql, path, framerates_header, cursor)
+                write_html_report_section("Video framerates", path, ",", html)
+                # Aspect ratio
+                path = os.path.join(csv_dir, "aspectRatios.csv")
+                DAR_header = ["Aspect Ratio", "Count"]
+                sql = "SELECT DisplayAspectRatio_String, COUNT(*) as 'num' FROM mediainfo WHERE format == 'Video' GROUP BY DisplayAspectRatio_String ORDER BY num DESC"
+                sqlite_to_csv(sql, path, DAR_header, cursor)
+                write_html_report_section("Video aspect ratios", path, ",", html)
+                # Bit depth
+                path = os.path.join(csv_dir, "videoBitdepth.csv")
+                depth_header = ["Video BitDepth", "Count"]
+                sql = "SELECT BitDepth_String, COUNT(*) as 'num' FROM mediainfo WHERE format == 'Video' GROUP BY BitDepth_String ORDER BY num DESC"
+                sqlite_to_csv(sql, path, DAR_header, cursor)
+                write_html_report_section("Video bitdepths", path, ",", html)
+            elif _format == "Audio":
+                # Audio sample rate/bit depth
+                path = os.path.join(csv_dir, "audioSampleBit.csv")
+                sr_depth_header = ["Audio Sampling Rate","Audio BitDepth", "Count"]
+                sql = "SELECT SamplingRate_String, BitDepth_String, COUNT(*) as 'num' FROM mediainfo WHERE format == 'Audio' GROUP BY SamplingRate_String, BitDepth_String ORDER BY num DESC"
+                sqlite_to_csv(sql, path, sr_depth_header, cursor)
+                write_html_report_section("Audio sampling rate/bit depth", path, ",", html)
+    
     # sorted mimetype list report
     sql = (
         "SELECT mime, COUNT(*) as 'num' FROM siegfried GROUP BY mime ORDER BY num DESC"
@@ -932,14 +1111,15 @@ def accept_or_run_siegfried(args, source_dir, use_hash):
 
 
 def process_content(
-    args, source_dir, cursor, conn, html, siegfried_version, use_hash, ssn_mode,
+    args, source_dir, cursor, conn, html, siegfried_version, mediainfo_version, use_hash, ssn_mode,
 ):
     """Run through main processing flow on specified directory"""
     scan_started = str(datetime.datetime.now())
     accept_or_run_siegfried(args, source_dir, use_hash)
-    use_hash = import_csv(cursor, conn, use_hash)
+    run_mediainfo(args, source_dir)
+    use_hash = import_data(args, cursor, conn, use_hash)
     create_html_report(
-        args, source_dir, scan_started, cursor, html, siegfried_version, use_hash,
+        args, source_dir, scan_started, cursor, html, siegfried_version, mediainfo_version, use_hash,
     )
     generate_reports(args, cursor, html, use_hash)
     if args.bulkextractor:
@@ -1176,6 +1356,13 @@ def _make_parser():
         help="Overwrite reports directory if it already exists",
         action="store_true",
     )
+    parser.add_argument(
+        "-m",
+        "--mediainfo",
+        help="Run Mediainfo on source directory",
+        action="store_true",
+        default=False
+    )
     parser.add_argument("source", help="Path to source directory or disk image")
     parser.add_argument("destination", help="Path to destination for reports")
     parser.add_argument(
@@ -1198,7 +1385,7 @@ def main():
 
     _configure_logging()
 
-    global source, destination, basename, report_dir, csv_dir, log_dir, bulkext_dir, sf_file, ssn_mode
+    global source, destination, basename, report_dir, csv_dir, log_dir, bulkext_dir, sf_file, ssn_mode, mi_file, mediainfo_version
     source = os.path.abspath(args.source)
     destination = os.path.abspath(args.destination)
     # Brunnhilde API backward compatibility: Use basename positional
@@ -1213,6 +1400,7 @@ def main():
     log_dir = os.path.join(report_dir, "logs")
     bulkext_dir = os.path.join(report_dir, "bulk_extractor")
     sf_file = os.path.join(report_dir, "siegfried.csv")
+    mi_file = os.path.join(report_dir, "mediainfo.json")
 
     # Create report directory
     if os.path.exists(report_dir):
@@ -1245,6 +1433,18 @@ def main():
             "Please ensure that all dependencies are properly installed."
         )
         sys.exit(1)
+
+    # Check that Mediainfo is installed if required
+    if args.mediainfo:
+        try:
+            out = subprocess.run(['mediainfo','--version'],stdout=subprocess.PIPE)
+            mediainfo_version = out.stdout.decode('utf-8')
+        except subprocess.CalledProcessError:
+            log_error_and_exit_message(
+                "Mediainfo is not installed or available on PATH. "
+                "Please ensure that all dependencies are properly installed."
+            )
+            sys.exit(1)
 
     # Check that source type is correct.
     if args.diskimage and not os.path.isfile(source):
@@ -1343,7 +1543,7 @@ def main():
         run_clamav(args, source)
 
     process_content(
-        args, source, cursor, conn, html, siegfried_version, use_hash, ssn_mode,
+        args, source, cursor, conn, html, siegfried_version, mediainfo_version, use_hash, ssn_mode,
     )
 
     # Delete carved_files directory if user elected not to keep it
